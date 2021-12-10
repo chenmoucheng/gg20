@@ -16,7 +16,7 @@ import           Data.ByteString                  (ByteString, append, drop, fol
 import           Data.FiniteField.Base            (order)
 import           Data.FiniteField.PrimeField      (PrimeField)
 import qualified Data.FiniteField.PrimeField as F (toInteger)
-import           Data.List                        ((!!), groupBy, transpose)
+import           Data.List                        ((!!), groupBy, sortBy, transpose)
 import           Data.List.Extra                  (allSame)
 import           Data.Maybe                       (fromJust)
 import           Data.Tuple                       (swap)
@@ -65,12 +65,16 @@ aG = derivePubKey . fromJust . secKey . toByteString
 h' :: PubKey -> Fq
 h' = fromByteString . drop 1 . exportPubKey True
 
+sign' :: Fq -> SecretKey -> Message -> Signature
+sign' k x m = let
+  r = h' (aG k)
+  s = recip k * (m + x * r)
+  in (r, min s $ - s)
+
 sign :: SecretKey -> Message -> IO Signature
 sign x m = do
   k <- randomIO
-  let r = h' (aG k)
-  let s = recip k * (m + x * r)
-  return (r, min s $ - s)
+  return $ sign' k x m
 
 verify :: PubKey -> Signature -> Message -> Bool
 verify pk (r, recip -> s') m = r == h' (sumP [aG (m * s'), aP (r * s') pk])
@@ -83,11 +87,29 @@ prop_secp256k1 = monadicIO $ do
   m <- randomIO
   (r, s) <- run $ sign x m
   assert $ verify (aG x) (r, s) m
-
+  {-
   let x' = fromJust . secKey $ toByteString x
   let m' = fromJust . msg $ toByteString m
   let rs = fromJust . importCompactSig . fromJust . compactSig $ toByteString r `append` toByteString s
   assert $ verifySig (derivePubKey x') rs m'
+  -}
+
+prop_secp256k1mpc :: Property
+prop_secp256k1mpc = monadicIO $ do
+  t <- randomRIO (1, 5)
+  n <- randomRIO (t, t + 5)
+  (x, shares) <- run $ mpcgen t n
+  let xs = stoa $ take t shares
+  ks <- replicateM t randomIO
+  rs <- replicateM t randomIO
+  let rG = sumP $ map aG rs
+  deltas <- run $ mpcmul ks rs
+  sigmas <- run $ mpcmul ks xs
+  let delta' = recip $ sum deltas
+  let r = h' (aP delta' rG)
+  m <- randomIO
+  let s = sum $ mpcadd (map (m *) ks) (map (r *) sigmas)
+  assert $ verify (aG x) (r, s) m
 
 --
 
@@ -148,7 +170,7 @@ mpcadd = zipWith (+)
 
 mtoa :: (Fq, Fq) -> IO (Fq, Fq)
 mtoa (a, b) = do
-  (pubkey, prvkey) <- genKey 100
+  (pubkey, prvkey) <- genKey 2048
   let encrypt' = encrypt pubkey . F.toInteger
   let decrypt' = fromInteger . decrypt prvkey pubkey
   let hadd = cipherMul pubkey
@@ -166,7 +188,7 @@ mpcmul as bs = do
   ab <- forM [ (i, j) | i <- [0 .. length as - 1], j <- [0 .. length bs - 1] ] $ \(i, j) -> do
     (alpha, beta) <- mtoa (as !! i, bs !! j)
     return [(i, alpha), (j, beta)]
-  return . map (sum . map snd) . groupBy (\ x y -> fst x == fst y) $ concat ab
+  return . map (sum . map snd) . groupBy (\ x y -> fst x == fst y) . sortBy (\ x y -> fst x `compare` fst y) $ concat ab
 
 {-
 
