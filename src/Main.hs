@@ -6,18 +6,19 @@
 
 module Main where
 
-import Prelude hiding (foldl, toInteger)
+import Prelude hiding (append, drop, foldl, reverse, toInteger)
 
 import           Control.Monad                    (forM, replicateM)
 import           Crypto.Secp256k1              
 import           Crypto.Paillier                  (cipherExp, cipherMul, decrypt, encrypt, genKey)
 import           Data.Bifunctor                   (first)
-import           Data.ByteString                  (ByteString, foldl, unfoldr)
+import           Data.ByteString                  (ByteString, append, drop, foldl, reverse, unfoldrN)
 import           Data.FiniteField.Base            (order)
 import           Data.FiniteField.PrimeField      (PrimeField)
 import qualified Data.FiniteField.PrimeField as F (toInteger)
 import           Data.List                        ((!!), groupBy, transpose)
 import           Data.List.Extra                  (allSame)
+import           Data.Maybe                       (fromJust)
 import           Data.Tuple                       (swap)
 import           Data.Word                        (Word8)
 import qualified Prelude                     as P (toInteger)
@@ -28,31 +29,73 @@ import           System.Random.Stateful           (Uniform(..), UniformRange(..)
 
 --
 
-type Fp = PrimeField 115792089237316195423570985008687907852837564279074904382605163141518161494337
-instance Random Fp
-instance Uniform Fp where
-  uniformM = uniformRM (0, fromInteger $ order @Fp undefined - 1)
-instance UniformRange Fp where
+type Fq = PrimeField 115792089237316195423570985008687907852837564279074904382605163141518161494337
+q :: Integer
+q = order @Fq undefined
+
+instance Random Fq
+instance Uniform Fq where
+  uniformM = uniformRM (0, fromInteger $ q - 1)
+instance UniformRange Fq where
   uniformRM (l, u) g = do
     x <- uniformRM (F.toInteger l, F.toInteger u) g
     return $ fromInteger x
 
-fromByteString :: ByteString -> Fp
-fromByteString = fromInteger . foldl f 0 where
-  f acc w = 256 * acc + P.toInteger w
+fromByteString :: ByteString -> Fq
+fromByteString = fromInteger . foldl f 0 . reverse where f acc w = 256 * acc + P.toInteger w
 
-toByteString :: Fp -> ByteString 
-toByteString = unfoldr f . F.toInteger where
-  f 0 = Nothing
-  f i = Just . first fromInteger . swap $ i `divMod` 256
+toByteString :: Fq -> ByteString 
+toByteString = reverse . fst . unfoldrN 32 (Just . first fromInteger . swap . flip divMod 256) . F.toInteger
 
 --
 
-type Polyn = [Fp]
-type AShare = Fp
-type SShare = (Fp, Fp)
+type Message = Fq
+type SecretKey = Fq
+type Signature = (Fq, Fq)
 
-foldrS :: (Fp -> Fp -> Fp) -> Fp -> [SShare] -> SShare
+sumP :: [PubKey] -> PubKey
+sumP = fromJust . combinePubKeys
+
+aP :: Fq -> PubKey -> PubKey
+aP a pk = fromJust . tweakMulPubKey pk . fromJust . tweak $ toByteString a
+
+aG :: Fq -> PubKey
+aG = derivePubKey . fromJust . secKey . toByteString
+
+h' :: PubKey -> Fq
+h' = fromByteString . drop 1 . exportPubKey True
+
+sign :: SecretKey -> Message -> IO Signature
+sign x m = do
+  k <- randomIO
+  let r = h' (aG k)
+  let s = recip k * (m + x * r)
+  return (r, min s $ - s)
+
+verify :: PubKey -> Signature -> Message -> Bool
+verify pk (r, recip -> s') m = r == h' (sumP [aG (m * s'), aP (r * s') pk])
+
+--
+
+prop_secp256k1 :: Property
+prop_secp256k1 = monadicIO $ do
+  x <- randomIO
+  m <- randomIO
+  (r, s) <- run $ sign x m
+  assert $ verify (aG x) (r, s) m
+
+  let x' = fromJust . secKey $ toByteString x
+  let m' = fromJust . msg $ toByteString m
+  let rs = fromJust . importCompactSig . fromJust . compactSig $ toByteString r `append` toByteString s
+  assert $ verifySig (derivePubKey x') rs m'
+
+--
+
+type Polyn = [Fq]
+type AShare = Fq
+type SShare = (Fq, Fq)
+
+foldrS :: (Fq -> Fq -> Fq) -> Fq -> [SShare] -> SShare
 foldrS _ _ [] = error "foldrS: empty list of shares"
 foldrS f z (unzip -> (is, ss))
   | allSame is = (head is, foldr f z ss)
@@ -66,7 +109,7 @@ sumS = foldrS (+) 0
 genA :: Int -> IO [AShare]
 genA = flip replicateM randomIO
 
-encodeS :: Int -> Int -> Fp -> IO [SShare]
+encodeS :: Int -> Int -> Fq -> IO [SShare]
 encodeS t n x = do
   xs <- replicateM (t - 1) randomIO
   let ev i = sum . zipWith (*) (map (i ^) [0 ..])
@@ -79,10 +122,10 @@ stoa (unzip -> (is, ss)) = zipWith (*) (map lambda is) ss where
     js = filter (/= i) is
     js' = map (flip (-) i) js
 
-decodeS :: [SShare] -> Fp
+decodeS :: [SShare] -> Fq
 decodeS = sum . stoa
 
---
+{-
 
 prop_shamir_secret_sharing :: Property
 prop_shamir_secret_sharing = monadicIO $ do
@@ -92,9 +135,9 @@ prop_shamir_secret_sharing = monadicIO $ do
   shares <- run $ encodeS t n x
   assert $ x == decodeS shares
 
---
+-}
 
-mpcgen :: Int -> Int -> IO (Fp, [SShare])
+mpcgen :: Int -> Int -> IO (Fq, [SShare])
 mpcgen t n = do
   us <- replicateM n randomIO
   ss <- mapM (encodeS t n) us
@@ -103,7 +146,7 @@ mpcgen t n = do
 mpcadd :: [AShare] -> [AShare] -> [AShare]
 mpcadd = zipWith (+)
 
-mtoa :: (Fp, Fp) -> IO (Fp, Fp)
+mtoa :: (Fq, Fq) -> IO (Fq, Fq)
 mtoa (a, b) = do
   (pubkey, prvkey) <- genKey 100
   let encrypt' = encrypt pubkey . F.toInteger
@@ -125,7 +168,7 @@ mpcmul as bs = do
     return [(i, alpha), (j, beta)]
   return . map (sum . map snd) . groupBy (\ x y -> fst x == fst y) $ concat ab
 
---
+{-
 
 prop_mpc :: Property
 prop_mpc = monadicIO $ do
@@ -139,7 +182,7 @@ prop_mpc = monadicIO $ do
   xy <- run $ mpcmul xs' ys'
   assert $ x * y == sum xy
 
---
+-}
 
 return []
 
