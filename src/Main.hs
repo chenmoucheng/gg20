@@ -131,12 +131,21 @@ sumS = foldrS (+) 0
 genA :: Int -> IO [AShare]
 genA = flip replicateM randomIO
 
-encodeS :: Int -> Int -> Fq -> IO [SShare]
-encodeS t n x = do
+encodeSV :: Int -> Int -> Fq -> IO ([SShare], [PubKey])
+encodeSV t n x = do
   xs <- replicateM (t - 1) randomIO
   let ev i = sum . zipWith (*) (map (i ^) [0 ..])
   let p i = (i, ev i $ x : xs)
-  return $ map (p . fromIntegral) [1 .. n]
+  return $ (map (p . fromIntegral) [1 .. n], map aG (x : xs))
+
+encodeS :: Int -> Int -> Fq -> IO ([SShare])
+encodeS t n x = do
+  (ss, _) <- encodeSV t n x
+  return ss
+
+verifyS :: [PubKey] -> SShare -> Bool
+verifyS vs (i, s) = aG s == sumP (zipWith ($) f vs) where
+  f = map aP $ map (i ^) [0 ..]
 
 stoa :: [SShare] -> [AShare]
 stoa (unzip -> (is, ss)) = zipWith (*) (map lambda is) ss where
@@ -154,8 +163,9 @@ prop_shamir_secret_sharing = monadicIO $ do
   t <- randomRIO (1, 5)
   n <- randomRIO (t, t + 5)
   x <- randomIO
-  shares <- run $ encodeS t n x
+  (shares, verifiers) <- run $ encodeSV t n x
   assert $ x == decodeS shares
+  assert . and $ map (verifyS verifiers) shares
 
 -}
 
